@@ -31,5 +31,18 @@
 *.out
 *.app
 
+# CMake / ROS build outputs
+build/
+devel/
+install/
+log/
+test_build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.catkin_tools/
+
 ./CMakeLists.txt
 .vscode
