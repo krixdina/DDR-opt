@@ -43,6 +43,21 @@ CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
 .catkin_tools/
+Makefile
+CTestTestfile.cmake
+Testing/
+.cache/
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Coverage / profiling outputs
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
 
 ./CMakeLists.txt
 .vscode
