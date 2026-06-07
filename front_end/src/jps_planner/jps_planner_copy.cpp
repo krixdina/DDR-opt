@@ -41,6 +41,9 @@ bool JPSPlanner::plan(const Eigen::Vector3d &start, const Eigen::Vector3d &goal)
     double safe_dis = std::max(std::min(safe_dis_, start_dis), 0.0);
     safe_dis = std::max(std::min(safe_dis, goal_dis), 0.0);
 
+    // 将起点和终点的栅格坐标交给底层 GraphSearch 做前端图搜索。
+    // 这里的 true 表示启用 JPS；若为 false，则退化为普通 A* 搜索。
+    // 搜索结果不会直接返回世界坐标路径，而是先保存在 GraphSearch 内部，随后通过 getPath() 取出。
     graph_search_->plan(start_idx(0), start_idx(1), goal_idx(0), goal_idx(1), true, 1e10);
 
     const auto path = graph_search_->getPath();
@@ -66,6 +69,7 @@ bool JPSPlanner::plan(const Eigen::Vector3d &start, const Eigen::Vector3d &goal)
     return true;
 }
 
+// 在代码中被注释，未使用
 void JPSPlanner::get_small_resolution_path_(){
     small_resolution_path_.clear();
 
@@ -93,6 +97,10 @@ void JPSPlanner::pubPath(const std::vector<Eigen::Vector2d> &path, const ros::Pu
     pub.publish(path_msg);
 }
 
+// 与 ST-opt-tools 中的路径简化逻辑完全一致
+// 对 JPS 搜索得到的折线路径做一次简化：
+// 若从“上一个保留点”可以无碰撞地直接连到更后面的点，
+// 就删除中间拐点，从而去掉锯齿状的小折线段。
 std::vector<Eigen::Vector2d> JPSPlanner::removeCornerPts(const std::vector<Eigen::Vector2d> &path) {
     if (path.size() < 2)
         return path;
@@ -101,8 +109,13 @@ std::vector<Eigen::Vector2d> JPSPlanner::removeCornerPts(const std::vector<Eigen
     std::vector<Eigen::Vector2d> optimized_path;
     Eigen::Vector2d pose1 = path[0];
     Eigen::Vector2d pose2 = path[1];
+    // prev_pose: 当前已经确认保留在结果路径中的“前一个关键点”。
     Eigen::Vector2d prev_pose = pose1;
     optimized_path.push_back(pose1);
+    // cost1: 当前方案中 prev_pose -> pose1 这段的代价
+    // cost2: 当前方案中 pose1 -> pose2 这段的代价
+    // cost3: 直接从 prev_pose -> pose2 跳过中间点的代价
+    // 这里的“代价”就是线段长度；若直连碰撞，则记为无穷大。
     double cost1, cost2, cost3;
 
     if (!checkLineCollision(pose1, pose2))
@@ -111,6 +124,7 @@ std::vector<Eigen::Vector2d> JPSPlanner::removeCornerPts(const std::vector<Eigen
         cost1 = std::numeric_limits<double>::infinity();
 
     for (unsigned int i = 1; i < path.size() - 1; i++) {
+        // 依次考察三点：prev_pose(上一个保留点)、pose1(候选中间点)、pose2(更后一个点)
         pose1 = path[i];
         pose2 = path[i + 1];
         if (!checkLineCollision(pose1, pose2))
@@ -123,15 +137,19 @@ std::vector<Eigen::Vector2d> JPSPlanner::removeCornerPts(const std::vector<Eigen
         else
             cost3 = std::numeric_limits<double>::infinity();
 
+        // 若 prev_pose 可以直接无碰撞连到 pose2，且更短，
+        // 说明 pose1 只是多余拐点，可以跳过不保留。
         if (cost3 < cost1 + cost2)
             cost1 = cost3;
         else {
+            // 否则说明 pose1 不能被安全且更优地跳过，需要保留为关键点。
             optimized_path.push_back(path[i]);
             cost1 = (pose1 - pose2).norm();
             prev_pose = pose1;
         }
     }
 
+    // 终点始终保留。
     optimized_path.push_back(path.back());
     return optimized_path;
 }
@@ -146,6 +164,12 @@ bool JPSPlanner::checkLineCollision(const Eigen::Vector2d &start, const Eigen::V
     return false;
 }
 
+// 注意：这个函数返回的不是“连续几何直线”，而是“直线段在栅格地图中的离散表示”。
+// 几何上，start 和 end 确定了一条直线段。但在栅格地图里，程序没法直接操作“连续直线”。
+// 所以它要把这条连续直线，转换成一串离散格子点。这串格子点连起来，看起来就是一条“栅格化的直线”。
+// 故给定 start 和 end 两个栅格点后，它会输出一串连续栅格，
+// 表示这条线段从起点到终点时，依次经过了哪些栅格。该函数返回的是这条直线经过的离散栅格序列。
+// 这里使用的是 Bresenham 风格的栅格直线遍历，用离散格子去逼近连续线段。
 std::vector<Eigen::Vector2i> JPSPlanner::getGridsBetweenPoints2D(const Eigen::Vector2i &start, const Eigen::Vector2i &end){
     std::vector<Eigen::Vector2i> line;
     
@@ -213,77 +237,125 @@ void JPSPlanner::getKinoNodeWithStartPath(const std::vector<Eigen::Vector3d> &st
     getTrajsWithTime();
 }
 
+// 将简化后的几何路径 Unoccupied_path_ 转换为一组离散“平坦状态”采样点。
+// 每个采样点用 state5d = [x, y, theta, dtheta, ds] 表示：
+// 1. x, y: 当前采样点位置
+// 2. theta: 当前段采用的航向角
+// 3. dtheta: 相对上一个采样状态的航向增量
+// 4. ds: 相对上一个采样状态的弧长增量
+// 这些离散状态随后会被 getTrajsWithTime() 进一步做时间分配，整理成 flat_traj_。
 void JPSPlanner::getSampleTraj(){
     Unoccupied_sample_trajs_.clear();
     double cur_theta;
 
+    // state5d: 当前构造出的 5 维采样状态 [x, y, theta, dtheta, ds]
     Eigen::VectorXd state5d;// x y theta dtheta ds
     state5d.resize(5);
+    // 先压入起点本身，初始时不发生转角和位移增量。
     state5d << start_state_.x(), start_state_.y(), start_state_.z(), 0, 0;
     Unoccupied_sample_trajs_.push_back(state5d); 
     
+    // 计算起点到第一段路径的朝向，并把角度调整到接近起始朝向的等价角。
     cur_theta = atan2(Unoccupied_path_[1].y() - Unoccupied_path_[0].y(), Unoccupied_path_[1].x() - Unoccupied_path_[0].x());
     normalizeAngle(start_state_.z(), cur_theta);
+    // 在起点位置插入一个“转向后”的状态：位置不变，只记录朝向变化。
     state5d << start_state_.x(), start_state_.y(), cur_theta , cur_theta - start_state_.z(), 0;
     Unoccupied_sample_trajs_.push_back(state5d); 
+
+    // 再插入一个等价朝向状态。这里通过反向向量 + pi 的写法重新得到同一几何方向，
+    // 其目的通常是为后续角度连续化和状态拼接提供更稳定的候选表示。
     cur_theta = atan2(Unoccupied_path_[0].y() - Unoccupied_path_[1].y(), Unoccupied_path_[0].x() - Unoccupied_path_[1].x()) + M_PI;
     normalizeAngle(start_state_.z(), cur_theta);
     state5d << start_state_.x(), start_state_.y(), cur_theta , cur_theta - start_state_.z(), 0;
     Unoccupied_sample_trajs_.push_back(state5d); // 2
     
     int path_size = Unoccupied_path_.size();
+    // pt: 当前处理的路径点（通常是中间拐点或终点）
     Eigen::VectorXd pt;
     for(int i = 1; i<path_size-1; i++){ 
         pt = Unoccupied_path_[i];
 
+        // 先加入“走到该点但保持上一段航向”的状态。
+        // Unoccupied_sample_trajs_.back()[2] 是上一采样状态的 theta。
+        // ds 是从上一采样状态位置走到当前点的直线距离。
         state5d << pt.x(), pt.y(), Unoccupied_sample_trajs_.back()[2], 0, sqrt(pow(pt.x() - Unoccupied_sample_trajs_.back()[0], 2) + pow(pt.y() - Unoccupied_sample_trajs_.back()[1], 2));
         Unoccupied_sample_trajs_.push_back(state5d);
+
+        // 再计算“从当前点指向下一点”的新航向，并插入一个原地转向状态。
         cur_theta = atan2(Unoccupied_path_[i+1].y() - Unoccupied_path_[i].y(), Unoccupied_path_[i+1].x() - Unoccupied_path_[i].x());
         normalizeAngle(Unoccupied_sample_trajs_.back()[2], cur_theta);
         state5d << pt.x(), pt.y(), cur_theta, cur_theta - Unoccupied_sample_trajs_.back()[2], 0;
         Unoccupied_sample_trajs_.push_back(state5d);
 
     }
+
+    // 处理终点位置：先走到终点，但先保持上一段航向。
     pt = Unoccupied_path_.back();
     state5d << pt.x(), pt.y(), Unoccupied_sample_trajs_.back()[2], 0, sqrt(pow(pt.x() - Unoccupied_sample_trajs_.back()[0], 2) + pow(pt.y() - Unoccupied_sample_trajs_.back()[1], 2));
     Unoccupied_sample_trajs_.push_back(state5d);
 
+    // 最后在终点位置补一个“转到目标最终朝向”的状态。
     cur_theta = end_state_.z();
     normalizeAngle(Unoccupied_sample_trajs_.back()[2], cur_theta);
     state5d << pt.x(), pt.y(), cur_theta, cur_theta - Unoccupied_sample_trajs_.back()[2], 0;
     Unoccupied_sample_trajs_.push_back(state5d);
 }
 
+// 在 getSampleTraj() 生成的离散状态基础上进一步加入时间信息，
+// 最终构造出后端优化器使用的 flat_traj_。
+// 主要分两步：
+// 1. 按 trajCutLength_ 对前端轨迹做长度截断，得到 cut_Unoccupied_sample_trajs_
+// 2. 依据加权路径长度和速度约束分配总时间，再按固定时间间隔进行插值采样
 void JPSPlanner::getTrajsWithTime(){
     cut_Unoccupied_sample_trajs_.clear();
 
 
+    // 下面三个数组是对截断后轨迹的辅助累计量：
+    // Unoccupied_thetas: 每个采样状态对应的 theta
+    // Unoccupied_pathlengths: 从起点累计的真实路径长度 s
+    // Unoccupied_Weightpathlengths: 从起点累计的“加权路径长度”
+    // 这里的加权长度 = yaw_weight_ * |dtheta| + distance_weight_ * |ds|
     std::vector<double> Unoccupied_thetas;
     std::vector<double> Unoccupied_pathlengths; 
     std::vector<double> Unoccupied_Weightpathlengths; 
 
+    // 累计的加权路径长度，用于后面时间分配。
     double Unoccupied_AllWeightingPathLength_ = 0; 
+    // 累计的真实路径长度，用于截断与平坦变量 s 的记录。
     double Unoccupied_AllPathLength = 0;
 
+    // if_cut: 记录本次前端轨迹是否因为 trajCutLength_ 被截断。
     bool if_cut = false;
+    // cut_state: 截断后的末端位姿；若未截断，则默认取原始采样序列的最后一个状态。
+    // Unoccupied_sample_trajs_ 是在 getSampleTraj() 中被赋值的
+    // cut_state = [最后一个状态的 x, y, theta]
     Eigen::Vector3d cut_state = Unoccupied_sample_trajs_.back().head(3);
 
     int PathNodeNum = Unoccupied_sample_trajs_.size();
+    // 截断轨迹总是从第一个采样状态开始。
     cut_Unoccupied_sample_trajs_.push_back(Unoccupied_sample_trajs_[0]);
     Unoccupied_thetas.push_back(Unoccupied_sample_trajs_[0][2]);
     Unoccupied_pathlengths.push_back(0);
     Unoccupied_Weightpathlengths.push_back(0);
-
     
+    // 逐段扫描 getSampleTraj() 生成的离散状态序列：
+    // 1. 若累计真实路径长度尚未超过 trajCutLength_ ，则直接保留当前状态；
+    // 2. 若当前这一段会使总长度超过 trajCutLength_，则在该段内部线性插值出截断点；
+    // 3. 同时更新截断后轨迹的真实长度、加权长度、theta 等辅助数组，供后续时间分配与插值采样使用。
     int pathnodeindex = 1;
     for(; pathnodeindex<PathNodeNum&&!if_cut; pathnodeindex++){
+        // pathnode = [x, y, theta, dtheta, ds]
         Eigen::VectorXd pathnode = Unoccupied_sample_trajs_[pathnodeindex];
+        // 一旦下一段位移会让累计真实长度超过 trajCutLength_，就在该段内部插值截断。
         if(Unoccupied_AllPathLength + fabs(pathnode[4]) >= trajCutLength_ && pathnode[4] != 0){
             if_cut = true;
             
+            // former_state: 截断段前一个已保留状态，用它和 pathnode 做线性插值求截断点。
             Eigen::Vector3d former_state = Unoccupied_sample_trajs_[pathnodeindex-1].head(3);
             cut_state = former_state + (pathnode.head(3) - former_state) * (trajCutLength_ - Unoccupied_AllPathLength) / fabs(pathnode[4]);
             Eigen::VectorXd state5d; state5d.resize(5);
+            // 对截断点同步构造 [x, y, theta, dtheta, ds]。
+            // 其中 dtheta、ds 都按当前段所占比例缩放。
             state5d<<cut_state.x(), cut_state.y(), cut_state.z(), (trajCutLength_ - Unoccupied_AllPathLength)/fabs(pathnode[4]) * pathnode[3], trajCutLength_ - Unoccupied_AllPathLength;
             cut_Unoccupied_sample_trajs_.push_back(state5d);
             Unoccupied_thetas.push_back(state5d[2]);
@@ -295,6 +367,7 @@ void JPSPlanner::getTrajsWithTime(){
             PathNodeNum = cut_Unoccupied_sample_trajs_.size();
             break;
         }
+        // 若尚未达到截断长度，则直接保留当前采样状态，并继续累计长度。
         cut_Unoccupied_sample_trajs_.push_back(pathnode);
         Unoccupied_thetas.push_back(pathnode[2]);
         Unoccupied_AllPathLength += pathnode[4];
@@ -303,33 +376,49 @@ void JPSPlanner::getTrajsWithTime(){
         Unoccupied_Weightpathlengths.push_back(Unoccupied_AllWeightingPathLength_);
     }
 
+    // 基于总加权长度和当前线速度约束，估计整段前端轨迹的执行总时间。
     double totalTrajTime_ = evaluateDuration(Unoccupied_AllWeightingPathLength_, current_state_VAJ_.x(),0.0,max_vel_,max_acc_);
+    // Unoccupied_traj_pts: 后端优化使用的平坦输出采样点，格式为 [yaw, s, t]
     std::vector<Eigen::Vector3d> Unoccupied_traj_pts; // Store the sampled coordinates yaw, s, t
+    // Unoccupied_positions: 与上述时刻对应的几何位姿采样，格式为 [x, y, yaw]
     std::vector<Eigen::Vector3d> Unoccupied_positions; // Store the sampled coordinates x, y, yaw
 
     double Unoccupied_totalTrajTime_ = totalTrajTime_;
     double Unoccupied_sampletime;
+    // Unoccupied_PathNodeIndex: 插值搜索的起始下标，避免每次都从头扫描。
     int Unoccupied_PathNodeIndex = 1;
 
+    // 采样时间步长尽量接近 sampletime_，同时保证至少采 mintrajNum_ 个点。
     Unoccupied_sampletime = Unoccupied_totalTrajTime_ / std::max(int(Unoccupied_totalTrajTime_ / sampletime_ + 0.5), mintrajNum_);
 
     PathNodeNum = cut_Unoccupied_sample_trajs_.size();
+    // tmparc: 当前轨迹节点对应的累计加权长度。
     double tmparc = 0;
 
+    // 按时间均匀采样。每个 samplet 对应一段“应走到的加权弧长 arc”，
+    // 再在 cut_Unoccupied_sample_trajs_ 上查找并插值出对应的 yaw / s / x / y。
     for(double samplet = Unoccupied_sampletime; samplet<Unoccupied_totalTrajTime_-1e-3; samplet+=Unoccupied_sampletime){
+        // 计算当前时刻应走到的加权弧长 arc
         double arc = evaluateLength(samplet, Unoccupied_AllWeightingPathLength_, Unoccupied_totalTrajTime_, current_state_VAJ_.x(), 0.0, max_vel_, max_acc_);
         for (int k = Unoccupied_PathNodeIndex; k<PathNodeNum; k++){
             Eigen::VectorXd pathnode = cut_Unoccupied_sample_trajs_[k];
             Eigen::VectorXd prepathnode = cut_Unoccupied_sample_trajs_[k-1];
+            // Unoccupied_Weightpathlengths[k] 表示“到第 k 个采样状态为止的累计加权路径长度”
             tmparc = Unoccupied_Weightpathlengths[k];
+            
+            // 如果累计加权长度大于当前时刻应走到的加权弧长，则进行插值
             if(tmparc >= arc){
                 Unoccupied_PathNodeIndex = k; 
+                // l: 当前这一段对应的加权长度增量
+                // l1: 从当前段终点回退到目标 arc 还差多少
                 double l1 = tmparc-arc;
                 double l = Unoccupied_Weightpathlengths[k]-Unoccupied_Weightpathlengths[k-1];
+                // interp_s / interp_yaw: 在当前段内线性插值得到的平坦变量
                 double interp_s = Unoccupied_pathlengths[k-1] + (l-l1)/l*(pathnode[4]);
                 double interp_yaw = cut_Unoccupied_sample_trajs_[k-1][2] + (l-l1)/l*(pathnode[3]);
                 Unoccupied_traj_pts.emplace_back(interp_yaw, interp_s, samplet);
 
+                // interp_x / interp_y: 在几何空间中对位置做线性插值。
                 double interp_x = l1/l*prepathnode[0] + (l-l1)/l*(pathnode[0]);
                 double interp_y = l1/l*prepathnode[1] + (l-l1)/l*(pathnode[1]);
                 Unoccupied_positions.emplace_back(interp_x, interp_y, interp_yaw);
@@ -338,6 +427,9 @@ void JPSPlanner::getTrajsWithTime(){
         }
     }
 
+    // 构造后端优化问题的起终状态。
+    // 这里 flat output 采用两维变量 [yaw, s]：
+    // startP / finalP 分别表示起终点的平坦位置。
     Eigen::MatrixXd startS;
     Eigen::MatrixXd endS;
     startS.resize(2,3);
@@ -350,6 +442,8 @@ void JPSPlanner::getTrajsWithTime(){
     endS.col(0) = finalP;
     endS.col(1).setZero();
     endS.col(2).setZero();
+
+    // 将本函数得到的时间化前端轨迹写入 flat_traj_，供 back_end/optimizer 使用。
     flat_traj_.UnOccupied_traj_pts = Unoccupied_traj_pts;
     flat_traj_.UnOccupied_initT = Unoccupied_sampletime;
     flat_traj_.UnOccupied_positions = Unoccupied_positions;
@@ -359,6 +453,7 @@ void JPSPlanner::getTrajsWithTime(){
     flat_traj_.start_state_XYTheta = start_state_;
     // flat_traj_.final_state_XYTheta = end_state_;
     flat_traj_.if_cut = if_cut;
+    // 若轨迹被截断，则这里是截断点位姿；否则就是原始末端位姿。
     flat_traj_.final_state_XYTheta = cut_state;
 
     // flat_traj_.printFlatTrajData();
@@ -451,6 +546,7 @@ double JPSPlanner::evaluateLength(const double &curt, const double &locallength,
   }
 }
 
+// 未被调用
 double JPSPlanner::evaluateVel(const double &curt, const double &locallength, const double &localtime, const double &startV, const double &endV, const double &maxV, const double &maxA){
   double critical_len; 
   double startv2 = pow(startV,2);
@@ -490,6 +586,7 @@ double JPSPlanner::evaluateVel(const double &curt, const double &locallength, co
   }
 }
 
+// 未被调用
 double JPSPlanner::evaluteTimeOfPos(const double &pos, const double &locallength, const double &startV, const double &endV, const double &maxV, const double &maxA){
   double critical_len;
   double startv2 = pow(startV,2);
